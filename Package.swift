@@ -15,7 +15,7 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "BugsPort",
-            url: "https://api.github.com/repos/hash-line/bugsport-client/releases/assets/308299383",
+            url: "https://github.com/hash-line/bugsport-client/releases/download/v0.1.1-pre-alpha/shared.xcframework.zip",
             checksum: "156829e89e87e885e5530fa41118616b73508b177057fe7a28421396d7b530f4"
         )
     ]
