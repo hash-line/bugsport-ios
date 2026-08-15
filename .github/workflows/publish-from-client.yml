@@ -1,0 +1,129 @@
+name: Publish SPM from KMP client
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without requiring a leading v
+        required: true
+        type: string
+      source_repo:
+        description: GitHub repo that uploaded the XCFramework artifact
+        required: true
+        type: string
+        default: hash-line/bugsport-client
+      source_run_id:
+        description: Workflow run id in the source repo
+        required: true
+        type: string
+      artifact_name:
+        description: Artifact name uploaded by the client workflow
+        required: true
+        type: string
+        default: ios-xcframework
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Create SPM release
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download XCFramework artifact
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          ok=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if gh run download "${{ inputs.source_run_id }}" \
+              --repo "${{ inputs.source_repo }}" \
+              --name "${{ inputs.artifact_name }}" \
+              --dir artifact; then
+              ok=1
+              break
+            fi
+            echo "Artifact not ready yet (attempt ${attempt}). Waiting 15s..."
+            sleep 15
+          done
+          if [ "$ok" != 1 ]; then
+            echo "Failed to download artifact ${{ inputs.artifact_name }} from ${{ inputs.source_repo }} run ${{ inputs.source_run_id }}"
+            exit 1
+          fi
+          ZIP=$(find artifact -name 'shared.xcframework.zip' | head -n 1)
+          if [ -z "$ZIP" ]; then
+            echo "shared.xcframework.zip not found after download"
+            find artifact -type f || true
+            exit 1
+          fi
+          cp "$ZIP" shared.xcframework.zip
+
+      - name: Compute checksum
+        id: checksum
+        run: |
+          CHECKSUM=$(swift package compute-checksum shared.xcframework.zip)
+          echo "value=$CHECKSUM" >> "$GITHUB_OUTPUT"
+          echo "Checksum: $CHECKSUM"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading asset"
+            gh release upload "$TAG" shared.xcframework.zip --clobber
+          else
+            gh release create "$TAG" shared.xcframework.zip \
+              --title "$TAG" \
+              --notes "BugsPort iOS XCFramework $TAG"
+          fi
+
+      - name: Update Package.swift
+        env:
+          TAG_VERSION: ${{ inputs.version }}
+          CHECKSUM: ${{ steps.checksum.outputs.value }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          version = os.environ["TAG_VERSION"].lstrip("v")
+          tag = f"v{version}"
+          checksum = os.environ["CHECKSUM"]
+          repo = os.environ["REPO"]
+          url = f"https://github.com/{repo}/releases/download/{tag}/shared.xcframework.zip"
+          path = Path("Package.swift")
+          text = path.read_text()
+          text, url_n = re.subn(r'url:\s*"[^"]+"', f'url: "{url}"', text, count=1)
+          text, sum_n = re.subn(r'checksum:\s*"[^"]+"', f'checksum: "{checksum}"', text, count=1)
+          if url_n != 1 or sum_n != 1:
+              raise SystemExit(f"Failed to patch Package.swift (url={url_n}, checksum={sum_n})")
+          path.write_text(text)
+          print(f"Updated Package.swift -> {url} checksum={checksum}")
+          PY
+
+      - name: Commit and push Package.swift
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          if git diff --cached --quiet; then
+            echo "Package.swift unchanged"
+            exit 0
+          fi
+          git commit -m "chore: point Package.swift at v${{ inputs.version }}"
+          git push
